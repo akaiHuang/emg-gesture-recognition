@@ -1,0 +1,675 @@
+"""Qt main window for the EMG monitor application."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+import numpy as np
+import pyqtgraph as pg
+from PyQt6 import QtCore, QtWidgets
+from qasync import asyncSlot
+
+from .. import config
+from ..buffers import EmgRingBuffer
+from ..data_parser import EmgSample, ImuSample
+from ..device_manager import DeviceManager
+from ..sim_device import SimulatedDeviceManager
+
+
+class PacketBridge(QtCore.QObject):
+    """Bridge raw callbacks to Qt signals."""
+
+    emg_received = QtCore.pyqtSignal(object)
+    imu_received = QtCore.pyqtSignal(object)
+    status_changed = QtCore.pyqtSignal(str)
+
+    def emit_packet(self, packet: EmgSample | ImuSample) -> None:
+        if isinstance(packet, EmgSample):
+            self.emg_received.emit(packet)
+        else:
+            self.imu_received.emit(packet)
+
+    def emit_status(self, message: str) -> None:
+        self.status_changed.emit(message)
+
+
+@dataclass
+class DeviceEntry:
+    label: str
+    address: str
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    """Top-level application window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("WL-EMG Monitor")
+        self._bridge = PacketBridge()
+        self._bridge.emg_received.connect(self._handle_emg_sample)
+        self._bridge.imu_received.connect(self._handle_imu_sample)
+        self._bridge.status_changed.connect(self._handle_status_update)
+
+        self._real_manager = DeviceManager(
+            notification_uuid=config.DEFAULT_NOTIFICATION_UUID,
+            on_packet=self._bridge.emit_packet,
+            on_status=self._bridge.emit_status,
+        )
+        self._sim_manager = SimulatedDeviceManager(
+            on_packet=self._bridge.emit_packet,
+            on_status=self._bridge.emit_status,
+        )
+        self._active_manager: Optional[
+            DeviceManager | SimulatedDeviceManager
+        ] = None
+
+        self._device_items: Dict[int, DeviceEntry] = {}
+        self._connected = False
+        self._buffer = EmgRingBuffer(
+            channels=config.EMG_CHANNELS,
+            capacity=config.SAMPLE_RATE_HZ * config.BUFFER_SECONDS,
+        )
+        self._display_offsets = [
+            idx * 400.0 for idx in range(config.EMG_CHANNELS)
+        ]
+        
+        # 狀態追蹤
+        self._last_packet_time = 0.0
+        self._packet_count = 0
+        self._signal_strength = 0.0
+        self._is_simulation = False
+
+        self._build_ui()
+        self._plot_timer = QtCore.QTimer(self)
+        self._plot_timer.setInterval(33)  # ~30 FPS
+        self._plot_timer.timeout.connect(self._refresh_plot)
+        self._plot_timer.start()
+
+        self._log("Ready.")
+
+    # ------------------------------------------------------------------ UI --
+    def _build_ui(self) -> None:
+        central = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(central)
+        
+        # 第一排控制按鈕：USB 檢測
+        usb_layout = QtWidgets.QHBoxLayout()
+        
+        self._usb_scan_button = QtWidgets.QPushButton("🔍 Search USB Device")
+        self._usb_scan_button.clicked.connect(self._on_usb_scan_clicked)
+        self._usb_scan_button.setStyleSheet("font-weight: bold; background-color: #4CD964; color: white;")
+        usb_layout.addWidget(self._usb_scan_button)
+        
+        # USB 裝置列表下拉選單
+        self._usb_device_combo = QtWidgets.QComboBox()
+        self._usb_device_combo.setMinimumWidth(400)
+        self._usb_device_combo.addItem("尚未掃描 - 請點擊 Search USB Device")
+        usb_layout.addWidget(self._usb_device_combo, stretch=1)
+        
+        self._usb_info_label = QtWidgets.QLabel("點擊按鈕檢測所有藍牙裝置")
+        self._usb_info_label.setStyleSheet("color: gray; font-style: italic;")
+        usb_layout.addWidget(self._usb_info_label)
+        usb_layout.addStretch()
+        
+        layout.addLayout(usb_layout)
+        
+        # 第二排控制按鈕：藍牙裝置掃描與連接
+        controls_layout = QtWidgets.QHBoxLayout()
+
+        self._scan_button = QtWidgets.QPushButton("Search Bluetooth Devices")
+        self._scan_button.clicked.connect(self._on_scan_clicked)
+        controls_layout.addWidget(self._scan_button)
+
+        self._device_combo = QtWidgets.QComboBox()
+        controls_layout.addWidget(self._device_combo)
+        self._device_combo.addItem("Simulation", userData="SIM")
+        self._device_items = {0: DeviceEntry("Simulation", "SIM")}
+
+        self._connect_button = QtWidgets.QPushButton("Connect")
+        self._connect_button.clicked.connect(self._on_connect_clicked)
+        controls_layout.addWidget(self._connect_button)
+
+        self._disconnect_button = QtWidgets.QPushButton("Disconnect")
+        self._disconnect_button.clicked.connect(self._on_disconnect_clicked)
+        self._disconnect_button.setEnabled(False)
+        controls_layout.addWidget(self._disconnect_button)
+
+        layout.addLayout(controls_layout)
+
+        # 狀態指示器區域
+        status_group = QtWidgets.QGroupBox("系統狀態")
+        status_layout = QtWidgets.QHBoxLayout()
+        
+        # 1. USB 接收器狀態（新增）
+        self._usb_status_label = QtWidgets.QLabel("🔌 USB 接收器")
+        self._usb_status_indicator = QtWidgets.QLabel("●")
+        self._usb_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._usb_status_text = QtWidgets.QLabel("未檢測")
+        self._usb_status_text.setStyleSheet("color: gray;")
+        status_layout.addWidget(self._usb_status_label)
+        status_layout.addWidget(self._usb_status_indicator)
+        status_layout.addWidget(self._usb_status_text)
+        status_layout.addSpacing(20)
+        
+        # 2. 藍牙功能狀態
+        self._bt_status_label = QtWidgets.QLabel("� 藍牙功能")
+        self._bt_status_indicator = QtWidgets.QLabel("●")
+        self._bt_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        status_layout.addWidget(self._bt_status_label)
+        status_layout.addWidget(self._bt_status_indicator)
+        status_layout.addSpacing(20)
+        
+        # 3. 裝置連接狀態
+        self._device_status_label = QtWidgets.QLabel("📱 EMG 裝置")
+        self._device_status_indicator = QtWidgets.QLabel("●")
+        self._device_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        status_layout.addWidget(self._device_status_label)
+        status_layout.addWidget(self._device_status_indicator)
+        status_layout.addSpacing(20)
+        
+        # 4. 訊號接收狀態
+        self._signal_status_label = QtWidgets.QLabel("� 訊號接收")
+        self._signal_status_indicator = QtWidgets.QLabel("●")
+        self._signal_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        status_layout.addWidget(self._signal_status_label)
+        status_layout.addWidget(self._signal_status_indicator)
+        status_layout.addSpacing(20)
+        
+        # 5. 訊號強度
+        self._strength_label = QtWidgets.QLabel("💪 訊號強度: --")
+        status_layout.addWidget(self._strength_label)
+        status_layout.addStretch()
+        
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        self._status_label = QtWidgets.QLabel("Status: Disconnected")
+        layout.addWidget(self._status_label)
+
+        self._plot_widget = pg.PlotWidget()
+        self._plot_widget.setBackground("k")
+        self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_widget.setLabel("left", "EMG (uV)")
+        self._plot_widget.setLabel("bottom", "Time (s)")
+        self._plot_widget.setLimits(xMin=-config.BUFFER_SECONDS, xMax=0)
+        layout.addWidget(self._plot_widget, stretch=1)
+
+        colors = [
+            "#FF3B30",
+            "#FF9500",
+            "#FFCC00",
+            "#4CD964",
+            "#5AC8FA",
+            "#007AFF",
+            "#5856D6",
+            "#FF2D55",
+        ]
+        self._curves = [
+            self._plot_widget.plot(
+                pen=pg.mkPen(color=colors[idx % len(colors)], width=1.5)
+            )
+            for idx in range(config.EMG_CHANNELS)
+        ]
+
+        self._log_view = QtWidgets.QPlainTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumHeight(120)
+        layout.addWidget(self._log_view)
+
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+        self.resize(1024, 768)
+
+    # -------------------------------------------------------------- Helpers --
+    def _current_device(self) -> DeviceEntry:
+        idx = self._device_combo.currentIndex()
+        entry = self._device_items.get(idx)
+        if entry is None:
+            raise ValueError("No device selected")
+        return entry
+
+    def _set_controls_enabled(self, scanning: bool = False) -> None:
+        self._scan_button.setEnabled(not self._connected and not scanning)
+        self._connect_button.setEnabled(not self._connected and not scanning)
+        self._disconnect_button.setEnabled(self._connected)
+        self._device_combo.setEnabled(not self._connected and not scanning)
+        self._usb_scan_button.setEnabled(not scanning)
+
+    def _log(self, message: str) -> None:
+        self._log_view.appendPlainText(message)
+
+    # ------------------------------------------------------------ Callbacks --
+    def _handle_emg_sample(self, sample: EmgSample) -> None:
+        try:
+            self._buffer.append(sample.channels_uv)
+            # 更新訊號接收狀態
+            import time
+            self._last_packet_time = time.time()
+            self._packet_count += 1
+            
+            # 計算訊號強度（使用所有通道的 RMS）
+            rms_values = [np.sqrt(np.mean(np.array(ch)**2)) for ch in sample.channels_uv]
+            self._signal_strength = np.mean(rms_values)
+            
+            # 更新訊號接收指示器為綠色
+            self._signal_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+            
+        except ValueError as exc:
+            self._log(f"EMG buffer error: {exc}")
+
+    def _handle_imu_sample(self, sample: ImuSample) -> None:
+        gyro = ", ".join(f"{axis:.2f}" for axis in sample.gyro_rads)
+        accel = ", ".join(f"{axis:.2f}" for axis in sample.accel_mss)
+        self._status_label.setText(
+            f"Status: Connected | Gyro {gyro} rad/s | Accel {accel} m/s^2"
+        )
+
+    def _handle_status_update(self, message: str) -> None:
+        self._log(message)
+        prefix = "Status: Connected | " if self._connected else "Status: "
+        self._status_label.setText(f"{prefix}{message}")
+
+    def _refresh_plot(self) -> None:
+        import time
+        
+        # 更新狀態指示器
+        current_time = time.time()
+        
+        # 檢查訊號是否還在接收（超過1秒沒收到就顯示紅色）
+        if self._connected and (current_time - self._last_packet_time) > 1.0:
+            self._signal_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._strength_label.setText("💪 訊號強度: 無訊號")
+        elif self._connected:
+            # 更新訊號強度顯示
+            if self._signal_strength > 100:
+                strength_text = "強 🟢"
+            elif self._signal_strength > 30:
+                strength_text = "中 🟡"
+            elif self._signal_strength > 0:
+                strength_text = "弱 🟠"
+            else:
+                strength_text = "無 ⚪"
+            self._strength_label.setText(f"💪 訊號強度: {self._signal_strength:.1f} μV ({strength_text})")
+        
+        data = self._buffer.snapshot()
+        if data.size == 0:
+            for curve in self._curves:
+                curve.clear()
+            return
+        points = data.shape[1]
+        duration = points / config.SAMPLE_RATE_HZ
+        x = np.linspace(-duration, 0, points)
+        for idx, curve in enumerate(self._curves):
+            channel_data = data[idx] + self._display_offsets[idx]
+            curve.setData(x, channel_data)
+        self._plot_widget.setYRange(
+            -200, self._display_offsets[-1] + 600, padding=0.01
+        )
+
+    # ---------------------------------------------------------- UI actions --
+    @asyncSlot()
+    async def _on_usb_scan_clicked(self) -> None:
+        """掃描 USB 裝置"""
+        self._set_controls_enabled(scanning=True)
+        self._log("🔍 掃描 USB 裝置...")
+        self._usb_info_label.setText("掃描中...")
+        self._usb_info_label.setStyleSheet("color: #FFCC00; font-style: italic;")
+        
+        # USB 狀態設為檢測中（黃色）
+        self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+        self._usb_status_text.setText("掃描中...")
+        self._usb_status_text.setStyleSheet("color: #FFCC00;")
+        
+        # 清空列表
+        self._usb_device_combo.clear()
+        
+        try:
+            # 使用更簡單的 ioreg 命令掃描 USB 裝置
+            import subprocess
+            
+            result = subprocess.run(
+                ["ioreg", "-p", "IOUSB", "-l", "-w", "0"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode != 0:
+                raise Exception("無法執行 ioreg")
+            
+            # 解析輸出
+            devices = self._parse_ioreg_usb(result.stdout)
+            data = json.loads(result.stdout)
+            devices = self._parse_usb_devices(data)
+            
+            if devices:
+                # 更新狀態
+                self._usb_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+                self._usb_status_text.setText(f"找到 {len(devices)} 個")
+                self._usb_status_text.setStyleSheet("color: #4CD964; font-weight: bold;")
+                
+                # 統計資訊
+                bluetooth_count = sum(1 for dev in devices if "bluetooth" in dev["name"].lower() or "bt" in dev["name"].lower())
+                
+                info = f"✓ 掃描完成：共找到 {len(devices)} 個 USB 裝置\n"
+                if bluetooth_count > 0:
+                    info += f"  - 藍牙相關裝置: {bluetooth_count} 個 📡\n"
+                info += f"\n提示：拔掉 USB 藍牙接收器再掃描一次，比較哪個裝置消失了"
+                self._log(info)
+                
+                self._usb_info_label.setText(f"✓ 找到 {len(devices)} 個 USB 裝置")
+                self._usb_info_label.setStyleSheet("color: #4CD964; font-weight: bold;")
+                
+                # 添加裝置到下拉選單
+                for dev in devices:
+                    name = dev["name"]
+                    vendor = dev.get("vendor", "")
+                    product_id = dev.get("product_id", "")
+                    vendor_id = dev.get("vendor_id", "")
+                    
+                    # 標記藍牙相關裝置
+                    if "bluetooth" in name.lower() or "bt" in name.lower():
+                        name = f"📡 {name}"
+                    
+                    label = f"{name}"
+                    if vendor:
+                        label += f" - {vendor}"
+                    if product_id or vendor_id:
+                        label += f" [{vendor_id}:{product_id}]"
+                    
+                    self._usb_device_combo.addItem(label)
+                
+                # 記錄詳細列表
+                self._log("\n掃描到的 USB 裝置列表：")
+                for i, dev in enumerate(devices, 1):
+                    name = dev["name"]
+                    vendor = dev.get("vendor", "Unknown")
+                    marker = "📡" if "bluetooth" in name.lower() or "bt" in name.lower() else "  "
+                    self._log(f"{marker} {i}. {name} ({vendor})")
+                
+            else:
+                # 沒找到任何裝置
+                self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+                self._usb_status_text.setText("無 USB 裝置")
+                self._usb_status_text.setStyleSheet("color: #FFCC00; font-weight: bold;")
+                
+                self._usb_device_combo.addItem("未找到任何 USB 裝置（可能只有內建裝置）")
+                self._usb_info_label.setText("未找到外接 USB 裝置")
+                self._usb_info_label.setStyleSheet("color: #FFCC00; font-style: italic;")
+                self._log("未找到外接 USB 裝置")
+                    
+        except subprocess.TimeoutExpired:
+            self._log("USB 掃描逾時")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("掃描逾時")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+            self._usb_device_combo.addItem("掃描逾時")
+            self._usb_info_label.setText("✗ 掃描逾時")
+            self._usb_info_label.setStyleSheet("color: #FF3B30; font-style: italic;")
+        except Exception as exc:
+            self._log(f"USB 掃描失敗: {exc}")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("掃描失敗")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+            self._usb_device_combo.addItem("掃描失敗")
+            self._usb_info_label.setText("✗ 掃描失敗")
+            self._usb_info_label.setStyleSheet("color: #FF3B30; font-style: italic;")
+        finally:
+            self._set_controls_enabled(scanning=False)
+    
+    def _parse_ioreg_usb(self, output: str) -> list:
+        """解析 ioreg USB 裝置資料"""
+        devices = []
+        lines = output.split('\n')
+        
+        current_device = None
+        for line in lines:
+            # 尋找裝置名稱
+            if '"USB Product Name" = ' in line:
+                name = line.split('"USB Product Name" = "')[1].split('"')[0]
+                current_device = {"name": name, "vendor": "", "product_id": "", "vendor_id": ""}
+            elif '"USB Vendor Name" = ' in line and current_device:
+                vendor = line.split('"USB Vendor Name" = "')[1].split('"')[0]
+                current_device["vendor"] = vendor
+            elif '"idProduct" = ' in line and current_device:
+                product_id = line.split('"idProduct" = ')[1].split('\n')[0].strip()
+                current_device["product_id"] = product_id
+            elif '"idVendor" = ' in line and current_device:
+                vendor_id = line.split('"idVendor" = ')[1].split('\n')[0].strip()
+                current_device["vendor_id"] = vendor_id
+                # 當找到 vendor_id 時，認為一個裝置資訊收集完畢
+                if current_device["name"]:
+                    devices.append(current_device)
+                current_device = None
+        
+        return devices
+
+    @asyncSlot()
+                # 更新狀態
+                self._usb_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+                self._usb_status_text.setText(f"找到 {len(devices)} 個")
+                self._usb_status_text.setStyleSheet("color: #4CD964; font-weight: bold;")
+                
+                # 統計資訊
+                bluetooth_count = sum(1 for dev in devices if "bluetooth" in dev["name"].lower() or "bt" in dev["name"].lower())
+                
+                info = f"✓ 掃描完成：共找到 {len(devices)} 個 USB 裝置\n"
+                if bluetooth_count > 0:
+                    info += f"  - 藍牙相關裝置: {bluetooth_count} 個 📡\n"
+                info += f"\n提示：拔掉 USB 藍牙接收器再掃描一次，比較哪個裝置消失了"
+                self._log(info)
+                
+                self._usb_info_label.setText(f"✓ 找到 {len(devices)} 個 USB 裝置")
+                self._usb_info_label.setStyleSheet("color: #4CD964; font-weight: bold;")
+                
+                # 添加裝置到下拉選單
+                for dev in devices:
+                    name = dev["name"]
+                    vendor = dev.get("vendor", "")
+                    product_id = dev.get("product_id", "")
+                    vendor_id = dev.get("vendor_id", "")
+                    
+                    # 標記藍牙相關裝置
+                    if "bluetooth" in name.lower() or "bt" in name.lower():
+                        name = f"📡 {name}"
+                    
+                    label = f"{name}"
+                    if vendor:
+                        label += f" - {vendor}"
+                    if product_id and vendor_id:
+                        label += f" [{vendor_id}:{product_id}]"
+                    
+                    self._usb_device_combo.addItem(label)
+                
+                # 記錄詳細列表
+                self._log("\n掃描到的 USB 裝置列表：")
+                for i, dev in enumerate(devices, 1):
+                    name = dev["name"]
+                    vendor = dev.get("vendor", "Unknown")
+                    marker = "📡" if "bluetooth" in name.lower() or "bt" in name.lower() else "  "
+                    self._log(f"{marker} {i}. {name} ({vendor})")
+                
+            else:
+                # 沒找到任何裝置
+                self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+                self._usb_status_text.setText("無 USB 裝置")
+                self._usb_status_text.setStyleSheet("color: #FFCC00; font-weight: bold;")
+                
+                self._usb_device_combo.addItem("未找到任何 USB 裝置（可能只有內建裝置）")
+                self._usb_info_label.setText("未找到外接 USB 裝置")
+                self._usb_info_label.setStyleSheet("color: #FFCC00; font-style: italic;")
+                self._log("未找到外接 USB 裝置")
+                    
+        except subprocess.TimeoutExpired:
+            self._log("USB 掃描逾時")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("掃描逾時")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+            self._usb_device_combo.addItem("掃描逾時")
+            self._usb_info_label.setText("✗ 掃描逾時")
+            self._usb_info_label.setStyleSheet("color: #FF3B30; font-style: italic;")
+        except Exception as exc:
+            self._log(f"USB 掃描失敗: {exc}")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("掃描失敗")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+            self._usb_device_combo.addItem("掃描失敗")
+            self._usb_info_label.setText("✗ 掃描失敗")
+            self._usb_info_label.setStyleSheet("color: #FF3B30; font-style: italic;")
+        finally:
+            self._set_controls_enabled(scanning=False)
+    
+    def _parse_usb_devices(self, data: dict) -> list:
+        """解析 USB 裝置資料"""
+        devices = []
+        
+        def extract_devices(item):
+            if isinstance(item, dict):
+                # 檢查是否是 USB 裝置
+                if "_name" in item:
+                    device_info = {
+                        "name": item.get("_name", "Unknown"),
+                        "vendor": item.get("manufacturer", ""),
+                        "product_id": item.get("product_id", ""),
+                        "vendor_id": item.get("vendor_id", ""),
+                    }
+                    # 排除系統內建裝置（通常沒有 product_id）
+                    if device_info["name"] != "USB" and device_info["name"] != "USB Bus":
+                        devices.append(device_info)
+                
+                # 遞迴處理 _items
+                if "_items" in item:
+                    for sub_item in item["_items"]:
+                        extract_devices(sub_item)
+                        
+            elif isinstance(item, list):
+                for sub_item in item:
+                    extract_devices(sub_item)
+        
+        # 從根開始解析
+        if "SPUSBDataType" in data:
+            for bus in data["SPUSBDataType"]:
+                extract_devices(bus)
+        
+        return devices
+
+    @asyncSlot()
+    async def _on_scan_clicked(self) -> None:
+        self._set_controls_enabled(scanning=True)
+        self._log("Starting Bluetooth scan...")
+        
+        # 嘗試掃描時，藍牙接收器狀態設為黃色（檢測中）
+        self._bt_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+        
+        self._device_combo.clear()
+        self._device_combo.addItem("Simulation", userData="SIM")
+        self._device_items = {0: DeviceEntry("Simulation", "SIM")}
+        try:
+            devices = await self._real_manager.scan(
+                timeout=config.DEFAULT_SCAN_TIMEOUT
+            )
+            # 掃描成功，藍牙接收器設為綠色
+            self._bt_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+            
+            # 檢查是否有 WL 裝置（表示 USB 接收器已連接）
+            has_wl_device = any("WL" in (dev.name or "").upper() or 
+                               "EEG" in (dev.name or "").upper() 
+                               for dev in devices)
+            
+            if has_wl_device:
+                self._usb_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+                self._usb_status_text.setText("已偵測到 WL 裝置")
+                self._usb_status_text.setStyleSheet("color: #4CD964; font-weight: bold;")
+            else:
+                self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+                self._usb_status_text.setText("未找到 WL 裝置")
+                self._usb_status_text.setStyleSheet("color: #FFCC00;")
+            
+            # 按 RSSI 排序（訊號強度由強到弱）
+            devices_sorted = sorted(devices, key=lambda d: d.rssi or -999, reverse=True)
+            
+            for dev in devices_sorted:
+                # 顯示訊號強度
+                rssi_text = f"[{dev.rssi}dBm]" if dev.rssi else "[?]"
+                
+                # 標記可能的 EMG 相關裝置
+                name = dev.name or "(unknown)"
+                if any(keyword in name.upper() for keyword in ["EMG", "WL", "SENSOR", "MUSCLE"]):
+                    name = f"⭐ {name}"
+                
+                label = f"{name} {rssi_text} ({dev.address})"
+                index = self._device_combo.count()
+                self._device_combo.addItem(label, userData=dev.address)
+                self._device_items[index] = DeviceEntry(label, dev.address)
+            
+            self._log(f"Found {len(devices)} device(s). 提示：拔掉 USB 再掃描一次，比較哪個裝置消失了")
+        except Exception as exc:
+            self._log(f"Scan failed: {exc}")
+            # 掃描失敗，藍牙接收器設為紅色
+            self._bt_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("掃描失敗")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+        finally:
+            self._set_controls_enabled(scanning=False)
+
+    @asyncSlot()
+    async def _on_connect_clicked(self) -> None:
+        entry = self._current_device()
+        if entry.address == "SIM":
+            manager = self._sim_manager
+            self._is_simulation = True
+            # 模擬模式：藍牙為灰色（不使用），裝置為藍色（模擬）
+            self._bt_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+            self._device_status_indicator.setStyleSheet("color: #007AFF; font-size: 20px;")
+        else:
+            manager = self._real_manager
+            self._is_simulation = False
+            # 真實模式：裝置連接中（黃色）
+            self._device_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+            
+        await self._disconnect_active()
+        self._active_manager = manager
+        try:
+            await manager.connect(entry.address)
+        except Exception as exc:
+            self._log(f"Connection failed: {exc}")
+            self._active_manager = None
+            # 連接失敗：裝置為紅色
+            self._device_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            return
+        self._connected = True
+        self._buffer.clear()
+        self._packet_count = 0
+        import time
+        self._last_packet_time = time.time()
+        self._set_controls_enabled()
+        
+        # 連接成功：裝置為綠色
+        self._device_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+        self._log(f"Connected to {entry.label}")
+
+    @asyncSlot()
+    async def _on_disconnect_clicked(self) -> None:
+        await self._disconnect_active()
+
+    async def _disconnect_active(self) -> None:
+        if not self._active_manager:
+            return
+        try:
+            await self._active_manager.disconnect()
+        except Exception as exc:
+            self._log(f"Error while disconnecting: {exc}")
+        self._active_manager = None
+        self._connected = False
+        self._packet_count = 0
+        self._signal_strength = 0.0
+        self._set_controls_enabled()
+        self._status_label.setText("Status: Disconnected")
+        
+        # 重置所有指示器為灰色
+        self._bt_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._device_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._signal_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._strength_label.setText("💪 訊號強度: --")

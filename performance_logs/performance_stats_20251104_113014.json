@@ -1,0 +1,80 @@
+{
+  "phase1_idle": {
+    "cpu": {
+      "min": 0.0,
+      "max": 35.5,
+      "avg": 9.6,
+      "samples": 5
+    },
+    "memory": {
+      "min": 326.1875,
+      "max": 343.96875,
+      "avg": 339.875,
+      "samples": 5
+    },
+    "threads": {
+      "min": 22,
+      "max": 25,
+      "avg": 24.2,
+      "samples": 5
+    },
+    "gpu": {
+      "min": 0.65,
+      "max": 15.11,
+      "avg": 10.629999999999999,
+      "samples": 5
+    }
+  },
+  "phase2_connected": {
+    "cpu": {
+      "min": 39.5,
+      "max": 60.7,
+      "avg": 51.03333333333333,
+      "samples": 6
+    },
+    "memory": {
+      "min": 345.8125,
+      "max": 352.125,
+      "avg": 346.9114583333333,
+      "samples": 6
+    },
+    "threads": {
+      "min": 24,
+      "max": 27,
+      "avg": 25.0,
+      "samples": 6
+    },
+    "gpu": {
+      "min": 21.75,
+      "max": 27.79,
+      "avg": 25.099999999999998,
+      "samples": 6
+    }
+  },
+  "phase3_camera": {
+    "cpu": {
+      "min": 54.2,
+      "max": 82.5,
+      "avg": 62.5,
+      "samples": 5
+    },
+    "memory": {
+      "min": 696.484375,
+      "max": 721.46875,
+      "avg": 708.30625,
+      "samples": 5
+    },
+    "threads": {
+      "min": 53,
+      "max": 76,
+      "avg": 62.4,
+      "samples": 5
+    },
+    "gpu": {
+      "min": 22.91,
+      "max": 26.22,
+      "avg": 24.456,
+      "samples": 5
+    }
+  }
+}

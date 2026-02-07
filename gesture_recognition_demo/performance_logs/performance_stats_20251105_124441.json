@@ -1,0 +1,80 @@
+{
+  "phase1_idle": {
+    "cpu": {
+      "min": 0.0,
+      "max": 1.5,
+      "avg": 0.34,
+      "samples": 5
+    },
+    "memory": {
+      "min": 227.0,
+      "max": 227.203125,
+      "avg": 227.08125,
+      "samples": 5
+    },
+    "threads": {
+      "min": 5,
+      "max": 7,
+      "avg": 6.6,
+      "samples": 5
+    },
+    "gpu": {
+      "min": 2.41,
+      "max": 32.73,
+      "avg": 11.652,
+      "samples": 5
+    }
+  },
+  "phase2_detecting": {
+    "cpu": {
+      "min": 38.6,
+      "max": 48.4,
+      "avg": 45.92,
+      "samples": 5
+    },
+    "memory": {
+      "min": 374.34375,
+      "max": 380.59375,
+      "avg": 379.046875,
+      "samples": 5
+    },
+    "threads": {
+      "min": 26,
+      "max": 26,
+      "avg": 26.0,
+      "samples": 5
+    },
+    "gpu": {
+      "min": 7.03,
+      "max": 9.93,
+      "avg": 8.04,
+      "samples": 5
+    }
+  },
+  "phase3_gesture": {
+    "cpu": {
+      "min": 33.8,
+      "max": 46.2,
+      "avg": 40.6,
+      "samples": 5
+    },
+    "memory": {
+      "min": 375.640625,
+      "max": 385.09375,
+      "avg": 382.934375,
+      "samples": 5
+    },
+    "threads": {
+      "min": 26,
+      "max": 26,
+      "avg": 26.0,
+      "samples": 5
+    },
+    "gpu": {
+      "min": 6.18,
+      "max": 7.85,
+      "avg": 7.164,
+      "samples": 5
+    }
+  }
+}

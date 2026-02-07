@@ -1,0 +1,173 @@
+{
+  "phase1_idle": [
+    {
+      "timestamp": "2025-11-05T15:24:46.460666",
+      "cpu_percent": 0.1,
+      "memory_mb": 463.84375,
+      "threads": 14,
+      "gpu": {
+        "frequency": 389,
+        "usage": 1.23,
+        "power_mw": 14
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:24:49.589215",
+      "cpu_percent": 0.1,
+      "memory_mb": 463.796875,
+      "threads": 13,
+      "gpu": {
+        "frequency": 389,
+        "usage": 1.03,
+        "power_mw": 0
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:24:52.714331",
+      "cpu_percent": 0.1,
+      "memory_mb": 463.71875,
+      "threads": 13,
+      "gpu": {
+        "frequency": 389,
+        "usage": 1.0,
+        "power_mw": 2
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:24:55.836272",
+      "cpu_percent": 0.2,
+      "memory_mb": 463.6875,
+      "threads": 13,
+      "gpu": {
+        "frequency": 739,
+        "usage": 0.8,
+        "power_mw": 16
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:24:58.964729",
+      "cpu_percent": 0.0,
+      "memory_mb": 463.6875,
+      "threads": 13,
+      "gpu": {
+        "frequency": 389,
+        "usage": 0.66,
+        "power_mw": 14
+      }
+    }
+  ],
+  "phase2_detecting": [
+    {
+      "timestamp": "2025-11-05T15:25:12.326971",
+      "cpu_percent": 122.0,
+      "memory_mb": 531.265625,
+      "threads": 62,
+      "gpu": {
+        "frequency": 389,
+        "usage": 17.64,
+        "power_mw": 115
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:15.440444",
+      "cpu_percent": 54.1,
+      "memory_mb": 530.703125,
+      "threads": 62,
+      "gpu": {
+        "frequency": 389,
+        "usage": 13.65,
+        "power_mw": 73
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:18.557057",
+      "cpu_percent": 52.2,
+      "memory_mb": 529.921875,
+      "threads": 35,
+      "gpu": {
+        "frequency": 389,
+        "usage": 38.6,
+        "power_mw": 206
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:21.680041",
+      "cpu_percent": 55.9,
+      "memory_mb": 529.765625,
+      "threads": 36,
+      "gpu": {
+        "frequency": 463,
+        "usage": 16.81,
+        "power_mw": 107
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:24.794773",
+      "cpu_percent": 56.5,
+      "memory_mb": 529.34375,
+      "threads": 36,
+      "gpu": {
+        "frequency": 389,
+        "usage": 16.87,
+        "power_mw": 91
+      }
+    }
+  ],
+  "phase3_gesture": [
+    {
+      "timestamp": "2025-11-05T15:25:30.895219",
+      "cpu_percent": 49.0,
+      "memory_mb": 529.421875,
+      "threads": 36,
+      "gpu": {
+        "frequency": 389,
+        "usage": 15.65,
+        "power_mw": 97
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:34.086526",
+      "cpu_percent": 84.8,
+      "memory_mb": 530.6875,
+      "threads": 36,
+      "gpu": {
+        "frequency": 398,
+        "usage": 14.69,
+        "power_mw": 75
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:37.196115",
+      "cpu_percent": 86.2,
+      "memory_mb": 529.640625,
+      "threads": 36,
+      "gpu": {
+        "frequency": 389,
+        "usage": 14.18,
+        "power_mw": 68
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:40.309007",
+      "cpu_percent": 66.5,
+      "memory_mb": 530.78125,
+      "threads": 36,
+      "gpu": {
+        "frequency": 389,
+        "usage": 14.39,
+        "power_mw": 75
+      }
+    },
+    {
+      "timestamp": "2025-11-05T15:25:43.424089",
+      "cpu_percent": 65.1,
+      "memory_mb": 530.25,
+      "threads": 36,
+      "gpu": {
+        "frequency": 389,
+        "usage": 14.45,
+        "power_mw": 77
+      }
+    }
+  ]
+}

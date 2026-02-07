@@ -1,0 +1,761 @@
+"""Qt main window for the EMG monitor application."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+import numpy as np
+import pyqtgraph as pg
+from PyQt6 import QtCore, QtWidgets
+from qasync import asyncSlot
+
+# macOS 優化設定：使用原生加速，關閉可能不穩定的功能
+pg.setConfigOptions(
+    useOpenGL=True,  # 在 macOS 上會自動使用 Metal 兼容層
+    antialias=False,  # 關閉抗鋸齒以提升效能
+    enableExperimental=False,  # 關閉實驗性功能
+)
+
+from .. import config
+from ..buffers import EmgRingBuffer
+from ..data_parser import EmgSample, ImuSample
+from ..device_manager import DeviceManager
+from ..sim_device import SimulatedDeviceManager
+from ..serial_device import SerialDeviceManager
+
+
+class PacketBridge(QtCore.QObject):
+    """Bridge raw callbacks to Qt signals."""
+
+    emg_received = QtCore.pyqtSignal(object)
+    imu_received = QtCore.pyqtSignal(object)
+    status_changed = QtCore.pyqtSignal(str)
+
+    def emit_packet(self, packet: EmgSample | ImuSample) -> None:
+        if isinstance(packet, EmgSample):
+            self.emg_received.emit(packet)
+        else:
+            self.imu_received.emit(packet)
+
+    def emit_status(self, message: str) -> None:
+        self.status_changed.emit(message)
+
+
+@dataclass
+class DeviceEntry:
+    label: str
+    address: str
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    """Top-level application window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("WL-EMG Monitor")
+        self._bridge = PacketBridge()
+        self._bridge.emg_received.connect(self._handle_emg_sample)
+        self._bridge.imu_received.connect(self._handle_imu_sample)
+        self._bridge.status_changed.connect(self._handle_status_update)
+
+        self._real_manager = DeviceManager(
+            notification_uuid=config.DEFAULT_NOTIFICATION_UUID,
+            on_packet=self._bridge.emit_packet,
+            on_status=self._bridge.emit_status,
+        )
+        self._serial_manager = SerialDeviceManager(
+            on_packet=self._bridge.emit_packet,
+            on_status=self._bridge.emit_status,
+        )
+        self._sim_manager = SimulatedDeviceManager(
+            on_packet=self._bridge.emit_packet,
+            on_status=self._bridge.emit_status,
+        )
+        self._active_manager: Optional[
+            DeviceManager | SerialDeviceManager | SimulatedDeviceManager
+        ] = None
+
+        self._device_items: Dict[int, DeviceEntry] = {}
+        self._connected = False
+        self._buffer = EmgRingBuffer(
+            channels=config.EMG_CHANNELS,
+            capacity=config.SAMPLE_RATE_HZ * config.BUFFER_SECONDS,
+        )
+        self._display_offsets = [
+            idx * 400.0 for idx in range(config.EMG_CHANNELS)
+        ]
+        
+        # 狀態追蹤
+        self._last_packet_time = 0.0
+        self._packet_count = 0
+        self._signal_strength = 0.0
+        self._is_simulation = False
+        
+        # 通道基線追蹤（用於計算變化量）
+        self._channel_baseline = [0.0] * config.EMG_CHANNELS
+        self._channel_last_values = [0.0] * config.EMG_CHANNELS
+        self._channel_current_state = [0] * config.EMG_CHANNELS  # 當前狀態（0=待機, 1=正常, 2=良好, 3=強訊號）
+        self._channel_noise_level = [0.0] * config.EMG_CHANNELS  # 每個通道的基線噪音水平
+        self._baseline_initialized = False  # 基線是否已初始化
+        self._initialization_samples = 500  # 初始化需要的樣本數（約2.5秒）
+        self._last_baseline_reset = 0  # 上次基線重置時間
+
+        self._build_ui()
+        self._plot_timer = QtCore.QTimer(self)
+        self._plot_timer.setInterval(100)  # 降低到 10 FPS，減少 CPU 負載
+        self._plot_timer.timeout.connect(self._refresh_plot)
+        self._plot_timer.start()
+
+        self._log("Ready.")
+        
+        # 啟動時自動掃描序列埠
+        QtCore.QTimer.singleShot(500, self._on_usb_scan_clicked)
+
+    # ------------------------------------------------------------------ UI --
+    def _build_ui(self) -> None:
+        central = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(central)
+        
+        # 控制按鈕：序列埠檢測與連接
+        controls_layout = QtWidgets.QHBoxLayout()
+        
+        self._usb_scan_button = QtWidgets.QPushButton("🔍 Scan Serial Ports")
+        self._usb_scan_button.clicked.connect(self._on_usb_scan_clicked)
+        self._usb_scan_button.setStyleSheet("font-weight: bold; background-color: #4CD964; color: white;")
+        controls_layout.addWidget(self._usb_scan_button)
+        
+        # 序列埠列表下拉選單
+        self._usb_device_combo = QtWidgets.QComboBox()
+        self._usb_device_combo.setMinimumWidth(400)
+        self._usb_device_combo.addItem("正在掃描...")
+        controls_layout.addWidget(self._usb_device_combo, stretch=1)
+
+        self._connect_button = QtWidgets.QPushButton("Connect")
+        self._connect_button.clicked.connect(self._on_connect_clicked)
+        controls_layout.addWidget(self._connect_button)
+
+        self._disconnect_button = QtWidgets.QPushButton("Disconnect")
+        self._disconnect_button.clicked.connect(self._on_disconnect_clicked)
+        self._disconnect_button.setEnabled(False)
+        controls_layout.addWidget(self._disconnect_button)
+        
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+
+        # 狀態指示器區域
+        status_group = QtWidgets.QGroupBox("系統狀態")
+        status_layout = QtWidgets.QHBoxLayout()
+        
+        # 1. USB 接收器狀態（新增）
+        self._usb_status_label = QtWidgets.QLabel("🔌 USB 接收器")
+        self._usb_status_indicator = QtWidgets.QLabel("●")
+        self._usb_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._usb_status_text = QtWidgets.QLabel("未檢測")
+        self._usb_status_text.setStyleSheet("color: gray;")
+        status_layout.addWidget(self._usb_status_label)
+        status_layout.addWidget(self._usb_status_indicator)
+        status_layout.addWidget(self._usb_status_text)
+        status_layout.addSpacing(20)
+        
+        # 訊號接收狀態
+        self._signal_status_label = QtWidgets.QLabel("📶 訊號接收")
+        self._signal_status_indicator = QtWidgets.QLabel("●")
+        self._signal_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        status_layout.addWidget(self._signal_status_label)
+        status_layout.addWidget(self._signal_status_indicator)
+        status_layout.addSpacing(20)
+        
+        # 訊號強度
+        self._strength_label = QtWidgets.QLabel("💪 訊號強度: --")
+        status_layout.addWidget(self._strength_label)
+        status_layout.addStretch()
+        
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 8 通道訊號監控面板
+        channels_group = QtWidgets.QGroupBox("8 通道訊號監控")
+        channels_layout = QtWidgets.QHBoxLayout()
+        
+        self._channel_indicators = []
+        self._channel_strength_labels = []
+        self._channel_quality_labels = []
+        
+        colors = ["#FF3B30", "#FF9500", "#FFCC00", "#4CD964", "#5AC8FA", "#007AFF", "#5856D6", "#FF2D55"]
+        
+        for i in range(config.EMG_CHANNELS):
+            # 每個通道的垂直佈局
+            ch_layout = QtWidgets.QVBoxLayout()
+            
+            # 通道標籤
+            ch_label = QtWidgets.QLabel(f"CH{i+1}")
+            ch_label.setStyleSheet(f"font-weight: bold; color: {colors[i]}; font-size: 12px;")
+            ch_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            ch_layout.addWidget(ch_label)
+            
+            # 訊號強度指示器（圓點）
+            indicator = QtWidgets.QLabel("●")
+            indicator.setStyleSheet("color: gray; font-size: 24px;")
+            indicator.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self._channel_indicators.append(indicator)
+            ch_layout.addWidget(indicator)
+            
+            # 訊號強度數值
+            strength_label = QtWidgets.QLabel("--")
+            strength_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            strength_label.setStyleSheet("font-size: 10px; color: #888;")
+            self._channel_strength_labels.append(strength_label)
+            ch_layout.addWidget(strength_label)
+            
+            # 訊號品質
+            quality_label = QtWidgets.QLabel("--")
+            quality_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            quality_label.setStyleSheet("font-size: 9px; color: #666;")
+            self._channel_quality_labels.append(quality_label)
+            ch_layout.addWidget(quality_label)
+            
+            channels_layout.addLayout(ch_layout)
+        
+        channels_group.setLayout(channels_layout)
+        layout.addWidget(channels_group)
+
+        self._status_label = QtWidgets.QLabel("Status: Disconnected")
+        layout.addWidget(self._status_label)
+
+        # 8 個獨立繪圖視窗（2x4 格局）
+        plots_group = QtWidgets.QGroupBox("8 通道即時波形")
+        plots_grid = QtWidgets.QGridLayout()
+        plots_grid.setSpacing(5)
+        
+        colors = [
+            "#FF3B30",  # CH1 紅色
+            "#FF9500",  # CH2 橙色
+            "#FFCC00",  # CH3 黃色
+            "#4CD964",  # CH4 綠色
+            "#5AC8FA",  # CH5 淺藍色
+            "#007AFF",  # CH6 藍色
+            "#5856D6",  # CH7 紫色
+            "#FF2D55",  # CH8 粉紅色
+        ]
+        
+        self._plot_widgets = []
+        self._curves = []
+        
+        for idx in range(config.EMG_CHANNELS):
+            # 創建每個通道的繪圖視窗
+            plot_widget = pg.PlotWidget()
+            plot_widget.setBackground("k")
+            plot_widget.showGrid(x=True, y=True, alpha=0.2)
+            plot_widget.setLabel("left", "Deviation (μV)", **{"font-size": "10pt"})
+            plot_widget.setLabel("bottom", "Time (s)", **{"font-size": "10pt"})
+            plot_widget.setTitle(f"CH{idx+1}", color=colors[idx], size="12pt")
+            plot_widget.setLimits(xMin=-config.BUFFER_SECONDS, xMax=0)
+            plot_widget.setYRange(-5000, 5000)  # 預設範圍
+            plot_widget.setMouseEnabled(x=False, y=True)  # 只允許 Y 軸縮放
+            
+            # 創建曲線
+            curve = plot_widget.plot(
+                pen=pg.mkPen(color=colors[idx], width=2)
+            )
+            
+            self._plot_widgets.append(plot_widget)
+            self._curves.append(curve)
+            
+            # 排列成 2 行 4 列
+            row = idx // 4
+            col = idx % 4
+            plots_grid.addWidget(plot_widget, row, col)
+        
+        plots_group.setLayout(plots_grid)
+        layout.addWidget(plots_group, stretch=1)
+
+        self._log_view = QtWidgets.QPlainTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_view.setMaximumHeight(80)
+        layout.addWidget(self._log_view)
+
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+        self.resize(1400, 900)
+
+    # -------------------------------------------------------------- Helpers --
+    def _current_device(self) -> DeviceEntry:
+        idx = self._device_combo.currentIndex()
+        entry = self._device_items.get(idx)
+        if entry is None:
+            raise ValueError("No device selected")
+        return entry
+
+    def _set_controls_enabled(self, scanning: bool = False) -> None:
+        self._connect_button.setEnabled(not self._connected and not scanning)
+        self._disconnect_button.setEnabled(self._connected)
+        self._usb_scan_button.setEnabled(not scanning)
+        self._usb_device_combo.setEnabled(not self._connected and not scanning)
+
+    def _log(self, message: str) -> None:
+        self._log_view.appendPlainText(message)
+
+    # ------------------------------------------------------------ Callbacks --
+    def _handle_emg_sample(self, sample: EmgSample) -> None:
+        try:
+            self._buffer.append(sample.channels_uv)
+            # 更新訊號接收狀態
+            import time
+            self._last_packet_time = time.time()
+            self._packet_count += 1
+            
+            # 初始化階段：只建立基線，不顯示訊號品質
+            if not self._baseline_initialized:
+                if self._packet_count <= self._initialization_samples:
+                    # 快速建立基線並累積活動度（用於計算噪音水平）
+                    for i, ch_value in enumerate(sample.channels_uv):
+                        alpha = 0.1  # 初始化時使用較快的更新速度
+                        self._channel_baseline[i] = alpha * ch_value + (1 - alpha) * self._channel_baseline[i]
+                        
+                        # 計算當前活動度並累積（用於計算平均噪音水平）
+                        if self._packet_count > 50:  # 前50個封包讓基線穩定
+                            deviation = abs(ch_value - self._channel_baseline[i])
+                            change_rate = abs(ch_value - self._channel_last_values[i])
+                            activity = (deviation * 0.7 + change_rate * 0.3)
+                            # 累積平均噪音水平
+                            self._channel_noise_level[i] += activity
+                        
+                        self._channel_last_values[i] = ch_value
+                    
+                    # 顯示初始化進度（降低頻率）
+                    if self._packet_count % 100 == 0:
+                        progress = (self._packet_count / self._initialization_samples) * 100
+                        print(f"基線初始化中... {progress:.0f}%")
+                    
+                    # 所有通道顯示為灰色「校準中」
+                    for i in range(8):
+                        if i < len(self._channel_indicators):
+                            self._channel_indicators[i].setStyleSheet("color: gray; font-size: 24px;")
+                            self._channel_quality_labels[i].setText("校準中")
+                            self._channel_quality_labels[i].setStyleSheet("font-size: 9px; color: #888;")
+                            self._channel_strength_labels[i].setText("--")
+                    
+                    return  # 初始化期間不進行訊號品質判斷
+                else:
+                    # 初始化完成：計算每個通道的平均噪音水平
+                    self._baseline_initialized = True
+                    for i in range(config.EMG_CHANNELS):
+                        # 計算平均噪音（除以有效樣本數）
+                        self._channel_noise_level[i] = self._channel_noise_level[i] / (self._initialization_samples - 50)
+                    
+                    print("基線初始化完成！")
+                    print(f"各通道基線: {[f'{b:.0f}' for b in self._channel_baseline]}")
+                    print(f"各通道噪音水平: {[f'{n:.0f}' for n in self._channel_noise_level]}")
+                    self._last_baseline_reset = self._packet_count
+            
+            # 定期重新校準基線（每 30 秒，當所有通道都在待機狀態時）
+            if self._packet_count - self._last_baseline_reset > 6000:  # 30秒
+                all_idle = all(state == 0 for state in self._channel_current_state)
+                if all_idle:
+                    print("\n⟳ 基線自動重新校準...")
+                    self._baseline_initialized = False
+                    self._packet_count = 0
+                    return
+            
+            # 正常運作：計算每個通道的訊號活動度（變化量）
+            channel_activity = []
+            for i, ch_value in enumerate(sample.channels_uv):
+                # 計算當前偏離值
+                deviation = abs(ch_value - self._channel_baseline[i])
+                
+                # 改進基線更新策略：使用自適應速率
+                if deviation < self._channel_noise_level[i] * 2:
+                    # 訊號接近基線，快速更新
+                    alpha = 0.02
+                elif deviation < self._channel_noise_level[i] * 5:
+                    # 中等訊號，慢速更新
+                    alpha = 0.002
+                else:
+                    # 強訊號，極慢更新（但不完全停止）
+                    alpha = 0.0001
+                
+                self._channel_baseline[i] = alpha * ch_value + (1 - alpha) * self._channel_baseline[i]
+                
+                # 活動度只看偏離值
+                activity = deviation
+                channel_activity.append(activity)
+                
+                # 更新上次數值
+                self._channel_last_values[i] = ch_value
+            
+            # 批次更新通道指示器（每 5 個封包更新一次，減少 UI 刷新）
+            if self._packet_count % 5 == 0:
+                for i, activity in enumerate(channel_activity):
+                    self._update_channel_indicator(i, activity)
+            
+            # 即時監測：每 50 個封包輸出一次（約 250ms 間隔，進一步降低負載）
+            # 如果不需要終端機監測，可以註解掉以下整個 if 區塊
+            if self._packet_count % 50 == 0:
+                # 顯示每個通道的活動度和狀態
+                status_map = {0: "待機", 1: "正常", 2: "良好", 3: "強訊號"}
+                ch_info = []
+                active_channels = []  # 記錄活躍的通道
+                
+                for i in range(len(channel_activity)):
+                    state_text = status_map.get(self._channel_current_state[i], "?")
+                    # 標記活躍的通道（活動度 > 閾值）
+                    threshold = self._channel_noise_level[i] * 2.5
+                    if channel_activity[i] > threshold:
+                        ch_info.append(f"CH{i+1}:【{channel_activity[i]:.0f}】{state_text}")
+                        active_channels.append(i+1)
+                    else:
+                        ch_info.append(f"CH{i+1}:{channel_activity[i]:.0f}")
+                
+                # 顯示活躍通道數（用於診斷串擾）
+                active_count = len(active_channels)
+                if active_count > 1:
+                    isolation_warning = f" ⚠️ {active_count}個通道活躍:{active_channels}"
+                else:
+                    isolation_warning = ""
+                
+                # 清除舊行並顯示新狀態（使用 \r 回到行首）
+                print(f"\r封包#{self._packet_count:5d} | " + " | ".join(ch_info) + isolation_warning, end="", flush=True)
+            
+            # 計算整體訊號強度
+            self._signal_strength = np.mean(channel_activity)
+            
+            # 更新訊號接收指示器為綠色
+            self._signal_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+            
+        except ValueError as exc:
+            self._log(f"EMG buffer error: {exc}")
+    
+    def _update_channel_indicator(self, channel_idx: int, strength: float) -> None:
+        """更新單個通道的訊號指示器（帶遲滯機制避免跳動）"""
+        if channel_idx >= len(self._channel_indicators):
+            return
+        
+        indicator = self._channel_indicators[channel_idx]
+        strength_label = self._channel_strength_labels[channel_idx]
+        quality_label = self._channel_quality_labels[channel_idx]
+        
+        # 更新強度數值（顯示活動度）
+        strength_label.setText(f"{strength:.0f}")
+        
+        # 取得當前狀態
+        current_state = self._channel_current_state[channel_idx]
+        
+        # 根據該通道的噪音水平動態設定閾值（倍率法）
+        # 基線噪音的 2.5 倍視為「正常」訊號，4 倍為「良好」，6 倍為「強訊號」
+        noise_baseline = max(self._channel_noise_level[channel_idx], 100)  # 至少100 μV
+        
+        # 使用遲滯閾值：上升閾值較高，下降閾值較低（避免反覆跳動）
+        # 定義閾值：[下降閾值, 上升閾值]
+        thresholds = {
+            0: (0, noise_baseline * 2.5),           # 待機 -> 正常：需要 > 2.5倍噪音
+            1: (noise_baseline * 2.0, noise_baseline * 4.0),  # 正常 <-> 良好
+            2: (noise_baseline * 3.5, noise_baseline * 6.0), # 良好 <-> 強訊號
+            3: (noise_baseline * 5.5, 999999)       # 強訊號
+        }
+        
+        # 決定新狀態（允許跨級下降）
+        new_state = current_state
+        
+        # 先判斷下降（可以跨級）
+        if strength < thresholds[0][1]:
+            # 低於正常閾值，回到待機
+            new_state = 0
+        elif strength < thresholds[1][1]:
+            # 低於良好閾值，但高於正常閾值
+            if current_state >= 2:
+                new_state = 1  # 從良好/強訊號降到正常
+        elif strength < thresholds[2][1]:
+            # 低於強訊號閾值
+            if current_state >= 3:
+                new_state = 2  # 從強訊號降到良好
+        
+        # 再判斷上升（需要遲滯）
+        if current_state == 0 and strength >= thresholds[0][1]:
+            new_state = 1
+        elif current_state == 1 and strength >= thresholds[1][1]:
+            new_state = 2
+        elif current_state == 2 and strength >= thresholds[2][1]:
+            new_state = 3
+        
+        # 更新狀態
+        self._channel_current_state[channel_idx] = new_state
+        
+        # 根據新狀態設定顯示
+        if new_state == 0:
+            # 待機：灰色
+            indicator.setStyleSheet("color: gray; font-size: 24px;")
+            quality_label.setText("待機")
+            quality_label.setStyleSheet("font-size: 9px; color: #888;")
+        elif new_state == 1:
+            # 正常：黃色
+            indicator.setStyleSheet("color: #FFCC00; font-size: 24px;")
+            quality_label.setText("正常")
+            quality_label.setStyleSheet("font-size: 9px; color: #FFCC00;")
+        elif new_state == 2:
+            # 良好：綠色
+            indicator.setStyleSheet("color: #4CD964; font-size: 24px;")
+            quality_label.setText("良好")
+            quality_label.setStyleSheet("font-size: 9px; color: #4CD964; font-weight: bold;")
+        else:
+            # 強訊號：紅色
+            indicator.setStyleSheet("color: #FF3B30; font-size: 24px;")
+            quality_label.setText("強訊號")
+            quality_label.setStyleSheet("font-size: 9px; color: #FF3B30; font-weight: bold;")
+
+    def _handle_imu_sample(self, sample: ImuSample) -> None:
+        gyro = ", ".join(f"{axis:.2f}" for axis in sample.gyro_rads)
+        accel = ", ".join(f"{axis:.2f}" for axis in sample.accel_mss)
+        self._status_label.setText(
+            f"Status: Connected | Gyro {gyro} rad/s | Accel {accel} m/s^2"
+        )
+
+    def _handle_status_update(self, message: str) -> None:
+        self._log(message)
+        prefix = "Status: Connected | " if self._connected else "Status: "
+        self._status_label.setText(f"{prefix}{message}")
+
+    def _refresh_plot(self) -> None:
+        import time
+        
+        # 只在連接時更新狀態（減少不必要的操作）
+        if not self._connected:
+            return
+        
+        # 更新狀態指示器
+        current_time = time.time()
+        
+        # 檢查訊號是否還在接收（超過1秒沒收到就顯示紅色）
+        if (current_time - self._last_packet_time) > 1.0:
+            self._signal_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._strength_label.setText("💪 訊號強度: 無訊號")
+        else:
+            # 更新訊號強度顯示（簡化）
+            if self._signal_strength > 100:
+                strength_text = "強🟢"
+            elif self._signal_strength > 30:
+                strength_text = "中🟡"
+            else:
+                strength_text = "弱🟠"
+            self._strength_label.setText(f"💪 {self._signal_strength:.0f}μV {strength_text}")
+        
+        # 繪圖：顯示偏差值（deviation），待機時為平線
+        data = self._buffer.snapshot()
+        if data.size == 0:
+            return
+        
+        points = data.shape[1]
+        duration = points / config.SAMPLE_RATE_HZ
+        x = np.linspace(-duration, 0, points)
+        
+        # 更新每個通道的獨立視窗
+        for idx, curve in enumerate(self._curves):
+            # 計算偏差值：原始訊號 - 基線
+            # 這樣待機時會是接近 0 的平線
+            if self._baseline_initialized:
+                deviation = data[idx] - self._channel_baseline[idx]
+            else:
+                # 基線未初始化時顯示原始值
+                deviation = data[idx]
+            
+            curve.setData(x, deviation)
+
+        # ---------------------------------------------------------- UI actions --
+    @asyncSlot()
+    async def _on_usb_scan_clicked(self) -> None:
+        """掃描序列埠 (Serial Ports) - 尋找藍牙接收器"""
+        self._set_controls_enabled(scanning=True)
+        self._log("🔍 掃描序列埠...")
+        
+        # USB 狀態設為檢測中（黃色）
+        self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+        
+        # 清空列表
+        self._usb_device_combo.clear()
+        
+        try:
+            # 使用 SerialDeviceManager 列出序列埠
+            usb_serial_ports = SerialDeviceManager.list_ports()
+            
+            if usb_serial_ports:
+                # 找到 USB 序列埠
+                self._usb_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+                
+                info = f"✓ 掃描完成：共找到 {len(usb_serial_ports)} 個 USB 序列埠"
+                self._log(info)
+                
+                # 將序列埠加入到下拉選單
+                for port in usb_serial_ports:
+                    # 標記可能是藍牙接收器的埠
+                    if 'usbserial' in port or 'usbmodem' in port:
+                        label = f"📡 {port} (USB Serial)"
+                    else:
+                        label = f"{port} (USB Serial)"
+                    
+                    self._usb_device_combo.addItem(label, userData=port)
+                
+                # 記錄詳細列表
+                self._log("\n掃描到的 USB 序列埠：")
+                for i, port in enumerate(usb_serial_ports, 1):
+                    self._log(f"  {i}. {port}")
+                
+            else:
+                # 沒找到 USB 序列埠
+                self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+                
+                self._usb_device_combo.addItem("未找到 USB 序列埠（請確認接收器已插入）")
+                self._log("未找到 USB 序列埠")
+                    
+        except Exception as exc:
+            self._log(f"序列埠掃描失敗: {exc}")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+            self._usb_device_combo.addItem("掃描失敗")
+            self._usb_info_label.setText("✗ 掃描失敗")
+            self._usb_info_label.setStyleSheet("color: #FF3B30; font-style: italic;")
+        finally:
+            self._set_controls_enabled(scanning=False)
+
+    @asyncSlot()
+    async def _on_scan_clicked(self) -> None:
+        """已棄用：藍牙掃描功能（現在只使用 USB 序列埠）"""
+        self._log("藍牙掃描功能已移除，請使用 USB 序列埠連接")
+        return
+        
+        # 嘗試掃描時，藍牙接收器狀態設為黃色（檢測中）
+        self._bt_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+        
+        self._device_combo.clear()
+        self._device_combo.addItem("Simulation", userData="SIM")
+        self._device_items = {0: DeviceEntry("Simulation", "SIM")}
+        try:
+            devices = await self._real_manager.scan(
+                timeout=config.DEFAULT_SCAN_TIMEOUT
+            )
+            # 掃描成功，藍牙接收器設為綠色
+            self._bt_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+            
+            # 檢查是否有 WL 裝置（表示 USB 接收器已連接）
+            has_wl_device = any("WL" in (dev.name or "").upper() or 
+                               "EEG" in (dev.name or "").upper() 
+                               for dev in devices)
+            
+            if has_wl_device:
+                self._usb_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+                self._usb_status_text.setText("已偵測到 WL 裝置")
+                self._usb_status_text.setStyleSheet("color: #4CD964; font-weight: bold;")
+            else:
+                self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+                self._usb_status_text.setText("未找到 WL 裝置")
+                self._usb_status_text.setStyleSheet("color: #FFCC00;")
+            
+            # 按 RSSI 排序（訊號強度由強到弱）
+            devices_sorted = sorted(devices, key=lambda d: d.rssi or -999, reverse=True)
+            
+            for dev in devices_sorted:
+                # 顯示訊號強度
+                rssi_text = f"[{dev.rssi}dBm]" if dev.rssi else "[?]"
+                
+                # 標記可能的 EMG 相關裝置
+                name = dev.name or "(unknown)"
+                if any(keyword in name.upper() for keyword in ["EMG", "WL", "SENSOR", "MUSCLE"]):
+                    name = f"⭐ {name}"
+                
+                label = f"{name} {rssi_text} ({dev.address})"
+                index = self._device_combo.count()
+                self._device_combo.addItem(label, userData=dev.address)
+                self._device_items[index] = DeviceEntry(label, dev.address)
+            
+            self._log(f"Found {len(devices)} device(s). 提示：拔掉 USB 再掃描一次，比較哪個裝置消失了")
+        except Exception as exc:
+            self._log(f"Scan failed: {exc}")
+            # 掃描失敗，藍牙接收器設為紅色
+            self._bt_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("掃描失敗")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+        finally:
+            self._set_controls_enabled(scanning=False)
+
+    @asyncSlot()
+    async def _on_connect_clicked(self) -> None:
+        # 從 USB 序列埠下拉選單獲取選擇的裝置
+        selected_port = self._usb_device_combo.currentText()
+        
+        if not selected_port or selected_port.startswith("正在") or selected_port.startswith("尚未"):
+            self._log("請先掃描並選擇一個序列埠")
+            return
+            
+        # 解析序列埠路徑（格式：/dev/xxx - 描述 或 /dev/xxx (描述)）
+        if " - " in selected_port:
+            port_path = selected_port.split(" - ")[0].strip()
+        elif " (" in selected_port:
+            port_path = selected_port.split(" (")[0].strip()
+        else:
+            port_path = selected_port.strip()
+        
+        if not port_path.startswith('/dev/'):
+            self._log(f"無效的序列埠：{port_path}")
+            return
+        
+        entry = DeviceEntry(label=selected_port, address=port_path)
+        
+        # 使用序列埠管理器
+        manager = self._serial_manager
+        self._is_simulation = False
+        
+        # USB 接收器連接中（黃色）
+        self._usb_status_indicator.setStyleSheet("color: #FFCC00; font-size: 20px;")
+        self._usb_status_text.setText("連接中...")
+        self._usb_status_text.setStyleSheet("color: #FFCC00;")
+            
+        await self._disconnect_active()
+        self._active_manager = manager
+        try:
+            await manager.connect(entry.address)
+        except Exception as exc:
+            self._log(f"連接失敗: {exc}")
+            self._active_manager = None
+            # 連接失敗：紅色
+            self._usb_status_indicator.setStyleSheet("color: #FF3B30; font-size: 20px;")
+            self._usb_status_text.setText("連接失敗")
+            self._usb_status_text.setStyleSheet("color: #FF3B30;")
+            return
+            
+        self._connected = True
+        self._buffer.clear()
+        self._packet_count = 0
+        import time
+        self._last_packet_time = time.time()
+        self._set_controls_enabled()
+        
+        # 連接成功：綠色
+        self._usb_status_indicator.setStyleSheet("color: #4CD964; font-size: 20px;")
+        self._usb_status_text.setText("已連接")
+        self._usb_status_text.setStyleSheet("color: #4CD964; font-weight: bold;")
+        self._log(f"已連接到 {entry.label}")
+
+    @asyncSlot()
+    async def _on_disconnect_clicked(self) -> None:
+        await self._disconnect_active()
+
+    async def _disconnect_active(self) -> None:
+        if not self._active_manager:
+            return
+        try:
+            await self._active_manager.disconnect()
+        except Exception as exc:
+            self._log(f"Error while disconnecting: {exc}")
+        self._active_manager = None
+        self._connected = False
+        self._packet_count = 0
+        self._signal_strength = 0.0
+        self._set_controls_enabled()
+        self._status_label.setText("Status: Disconnected")
+        
+        # 重置所有指示器為灰色
+        self._usb_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._usb_status_text.setText("未檢測")
+        self._usb_status_text.setStyleSheet("color: gray;")
+        self._signal_status_indicator.setStyleSheet("color: gray; font-size: 20px;")
+        self._strength_label.setText("💪 訊號強度: --")

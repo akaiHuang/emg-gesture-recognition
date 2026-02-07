@@ -1,0 +1,5 @@
+PyQt6>=6.7.0
+pyqtgraph>=0.13.7
+bleak>=0.22.0
+numpy>=1.26.0
+qasync>=0.25.0
