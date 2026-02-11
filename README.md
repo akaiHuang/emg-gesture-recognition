@@ -4,6 +4,10 @@
 
 EMG Gesture Recognition 是一套即時肌電（EMG）訊號擷取與手勢辨識系統，針對多通道生物訊號提供端到端處理流程。適合用於穿戴式互動、復健/運動監測與生物訊號驅動介面的研究與原型。
 
+## About (EN)
+
+EMG Gesture Recognition is a real-time multi-channel EMG signal interface with synchronized recording and gesture recognition capabilities. It is intended for wearable interaction research, rehabilitation monitoring, and biosignal-driven interface prototyping.
+
 ## 📋 Quick Summary
 
 > 💪 **EMG Gesture Recognition** 是一套即時 8 通道肌電訊號（EMG）生物感測介面系統，專為肌肉活動監測與手勢辨識設計。📡 直接連接 WL-EMG 硬體設備，支援 USB 藍牙接收器與 BLE 自動偵測，以 200Hz 取樣率即時擷取 24-bit ADC 高精度訊號。📊 提供雙視圖顯示系統——全通道合併檢視與 8 個獨立示波器（2x4 網格），搭配 Metal/OpenGL GPU 加速渲染。✋ 整合 MediaPipe 21 關鍵點手部骨架追蹤，支援 9 種預設手勢辨識（握拳、張開、捏取、豎拇指等）。🎥 同步錄製 EMG 訊號 + 攝影機影像 + 手部骨架數據，完美時間對齊。⚡ 經過迭代效能優化，CPU 使用率降低 54%、記憶體降低 83%。🧠 採用 PyQt6、PyTorch、OpenCV 等技術棧，適合人機互動、穿戴式運算、神經介面研究領域的研究者與工程師！
